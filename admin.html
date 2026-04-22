@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <title>간부회의자료 작성 — 관리자 페이지</title>
+  <link rel="stylesheet" href="./assets/css/app.css?v=4" />
+</head>
+<body>
+  <div class="app-shell">
+    <div class="topbar">
+      <div>
+        <strong>간부회의자료 관리자</strong>
+      </div>
+      <nav class="nav">
+        <a href="./index.html">작성자</a>
+        <a href="./admin.html">관리자</a>
+      </nav>
+    </div>
+    <div id="app-root">
+      <div class="banner" id="boot-banner">
+        HTML 로드됨 · 자바스크립트 모듈 로딩 중…
+        <span class="muted" id="boot-timer">(0초)</span>
+      </div>
+    </div>
+    <div class="footnote">
+      이 페이지는 URL로만 구분됩니다. 공개 배포 시 관리자 URL을 유출하지 않도록 주의하세요.
+    </div>
+  </div>
+  <script>
+    // 인라인 진단: HTML 로드는 되었는데 JS 모듈이 실행되지 않는 경우 감지
+    (function(){
+      var htmlLoadedAt = Date.now();
+      window.__htmlLoadedAt = htmlLoadedAt;
+      console.log('[admin.html] HTML loaded at', new Date(htmlLoadedAt).toISOString());
+      var timerEl = document.getElementById('boot-timer');
+      var iv = setInterval(function(){
+        var s = Math.floor((Date.now() - htmlLoadedAt)/1000);
+        if (timerEl) timerEl.textContent = '(' + s + '초)';
+        // 3초가 지났는데도 admin-view.js가 로드 흔적을 안 남겼으면 경고
+        if (s === 3 && !window.__adminViewEntered) {
+          var b = document.getElementById('boot-banner');
+          if (b) b.innerHTML =
+            '<strong style="color:#b91c1c">⚠ JavaScript 모듈 실행 지연</strong> '
+            + '<span class="muted">(' + s + '초)</span><br/>'
+            + '3초가 지났는데도 admin-view.js 가 실행되지 않았습니다. 원인 후보:<br/>'
+            + '1) <strong>브라우저 캐시</strong> — 시크릿 창(Ctrl+Shift+N)에서 열어보세요<br/>'
+            + '2) <strong>Firebase SDK CDN 차단</strong> — 사내망이 <code>gstatic.com</code>을 차단하는 경우<br/>'
+            + '3) <strong>JS 문법 오류</strong> — F12 → Console 탭의 빨간 메시지 확인';
+        }
+        // adminView 진입했으면 타이머 정리 (adminView 자체 로딩 HUD로 교체됨)
+        if (window.__adminViewEntered) clearInterval(iv);
+      }, 1000);
+    })();
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+  <!-- 아래 script 태그는 매 로드마다 쿼리를 바꿔 캐시를 우회 -->
+  <script>
+    (function(){
+      var s = document.createElement('script');
+      s.type = 'module';
+      s.src = './assets/js/views/admin-view.js?v=' + Date.now();
+      document.body.appendChild(s);
+    })();
+  </script>
+</body>
+</html>
