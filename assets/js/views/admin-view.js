@@ -1,5 +1,8 @@
 // 관리자 페이지 로직
-import { ensureSignedIn, isConfigPlaceholder, db } from '../firebase-init.js';
+import {
+  ensureAdminSignedIn, signOutAdmin, currentUser, isAnonymousUser,
+  isConfigPlaceholder, db,
+} from '../firebase-init.js';
 import { getDoc, doc } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js';
 import {
   subscribeAuthors, subscribeCategories, subscribeCurrent,
@@ -16,7 +19,7 @@ import { computeRanges, relativeTimeLabel, formatYMDDash } from '../util/date.js
 import { buildHwpxBlob, suggestFileName } from '../hwpx/hwpx-builder.js';
 import { downloadBlob } from '../util/download.js';
 
-const BUILD_TAG = 'admin-v12-2026-04-22';
+const BUILD_TAG = 'admin-v13-2026-04-24';
 
 // HTML의 인라인 진단 스크립트에게 "모듈이 실제로 실행 시작됨"을 알림
 if (typeof window !== 'undefined') {
@@ -46,64 +49,125 @@ function escapeHtml(s) {
   }[c]));
 }
 
-let _loadingActive = false;
-let _loadingStart = 0;
-function startLoadingHud() {
-  _loadingActive = true;
-  _loadingStart = Date.now();
-  // 초기 1회 렌더: 로딩 상태 + 진행 로그 + 타이머 <span>
-  $('#app-root').innerHTML = `
-    <div class="banner">
-      <strong>Firebase 연결 중…</strong>
-      <span class="muted">(<span id="hud-elapsed">0</span>초 경과, 10초 후 자동 타임아웃)</span><br/>
-      <code style="font-size:11px">build: ${BUILD_TAG}</code>
-    </div>
-    <div class="panel">
-      <h3 style="margin-top:0">진행 로그 (디버그)</h3>
-      <pre id="boot-log" style="font-size:11px; white-space:pre-wrap; margin:0; font-family:ui-monospace,SFMono-Regular,monospace; color:#374151">(로그 대기 중…)</pre>
-    </div>`;
-  // setInterval 대신 setTimeout 재귀로 HUD 경과초 갱신
-  const tick = () => {
-    if (!_loadingActive) return;
-    const s = Math.floor((Date.now() - _loadingStart) / 1000);
-    const el = document.getElementById('hud-elapsed');
-    if (el) el.textContent = String(s);
-    setTimeout(tick, 500);
-  };
-  setTimeout(tick, 500);
-  stage('startLoadingHud: HUD 초기 렌더 완료, setTimeout tick 등록');
-}
-function stopLoadingHud() { _loadingActive = false; }
 function statusText(s) {
   return { idle: '작성전', draft: '작성중', submitted: '작성완료' }[s] || s;
 }
 
 let activeTab = 'round';
+let _appMounted = false;  // 실제 앱 구독이 1회 이상 mount 되었는지
+
+// ─────────────────────────────────────────────────────────
+// 1. 부팅 — 로그인 랜딩 → 관리자 확인 → 앱 mount
+// ─────────────────────────────────────────────────────────
+
+function renderAuthLanding(message) {
+  const buildLine = `<code style="font-size:11px">build: ${BUILD_TAG}</code>`;
+  $('#app-root').innerHTML = `
+    <div class="panel" style="max-width:540px; margin:40px auto; text-align:center">
+      <h2 style="margin-top:0">관리자 로그인</h2>
+      <p class="muted">이 페이지는 사전에 등록된 Google 계정으로만 접근할 수 있습니다.</p>
+      ${message ? `<div class="banner warn" style="text-align:left">${message}</div>` : ''}
+      <div style="margin:20px 0">
+        <button class="btn primary" id="btn-admin-login" style="padding:10px 20px; font-size:15px">Google 계정으로 로그인</button>
+      </div>
+      <div class="muted" style="font-size:12px">${buildLine}</div>
+    </div>
+    <div class="panel" style="max-width:540px; margin:0 auto">
+      <h3 style="margin-top:0">진행 로그 (디버그)</h3>
+      <pre id="boot-log" style="font-size:11px; white-space:pre-wrap; margin:0; font-family:ui-monospace,SFMono-Regular,monospace; color:#374151">${_bootLog.join('\n') || '(로그 대기 중…)'}</pre>
+    </div>`;
+  $('#btn-admin-login').addEventListener('click', () => { doLoginAndMount(); });
+}
+
+function renderNotAdmin(err) {
+  const uid = err?.attemptedUid || '(알 수 없음)';
+  const email = err?.attemptedEmail || '(알 수 없음)';
+  $('#app-root').innerHTML = `
+    <div class="panel" style="max-width:640px; margin:40px auto">
+      <h2 style="margin-top:0; color:#b91c1c">관리자 권한이 없습니다</h2>
+      <p>로그인은 성공했지만 이 계정은 관리자 목록에 등록되어 있지 않습니다.</p>
+      <div class="banner" style="text-align:left">
+        <div><strong>로그인 이메일</strong>: ${escapeHtml(email)}</div>
+        <div><strong>Firebase uid</strong>: <code>${escapeHtml(uid)}</code></div>
+      </div>
+      <h3>관리자 등록 방법 (최초 1회)</h3>
+      <ol>
+        <li>위 <code>uid</code> 문자열을 복사합니다.</li>
+        <li>Firebase 콘솔 → Firestore Database → <code>config</code> 컬렉션 → <code>admins</code> 문서를 엽니다. 없으면 "문서 추가"로 생성.</li>
+        <li><code>uids</code> 라는 <strong>Array</strong> 필드에 방금 복사한 uid 를 string 으로 추가합니다.</li>
+        <li>저장 후 이 페이지에서 "다시 시도" 버튼을 누르세요.</li>
+      </ol>
+      <div class="row">
+        <button class="btn primary" id="btn-retry">다시 시도</button>
+        <button class="btn" id="btn-signout">다른 계정으로 로그인</button>
+      </div>
+    </div>`;
+  $('#btn-retry').addEventListener('click', () => { doLoginAndMount(); });
+  $('#btn-signout').addEventListener('click', async () => {
+    await signOutAdmin();
+    renderAuthLanding('');
+  });
+}
+
+async function doLoginAndMount() {
+  // 로그인 시도 중에는 보이는 버튼을 잠시 비활성화 — 사용자 반복 클릭 방지
+  const btn = document.getElementById('btn-admin-login');
+  if (btn) { btn.disabled = true; btn.textContent = '로그인 팝업 확인 중…'; }
+
+  stage('ensureAdminSignedIn() 호출 전');
+  let uid;
+  try {
+    uid = await ensureAdminSignedIn();
+    stage('ensureAdminSignedIn() 완료: uid=' + uid);
+  } catch (e) {
+    stage('ensureAdminSignedIn() 실패: ' + (e?.code || e?.message || e));
+    if (e?.code === 'auth/not-admin') {
+      renderNotAdmin(e);
+      return;
+    }
+    // 팝업 차단, 사용자가 닫음 등
+    showAuthError(e);
+    return;
+  }
+  await mountApp();
+}
+
+function showAuthError(err) {
+  const code = err?.code || err?.name || 'Error';
+  const msg = err?.message || String(err);
+  const tips = diagnosisFor(code, msg);
+  $('#app-root').innerHTML = `
+    <div class="panel" style="max-width:640px; margin:40px auto">
+      <div class="banner danger">
+        <strong>관리자 로그인 실패</strong><br/>
+        <code>${escapeHtml(code)}</code>: ${escapeHtml(msg)}
+      </div>
+      <h3>가능한 원인과 해결</h3>
+      <ul>${tips.map(t => `<li>${t}</li>`).join('')}</ul>
+      <div class="row">
+        <button class="btn primary" id="btn-retry">다시 시도</button>
+      </div>
+    </div>`;
+  $('#btn-retry').addEventListener('click', () => renderAuthLanding(''));
+}
+
+// ─────────────────────────────────────────────────────────
+// 2. 앱 mount (로그인+화이트리스트 통과 후)
+// ─────────────────────────────────────────────────────────
 
 async function mountApp() {
-  if (isConfigPlaceholder()) {
-    $('#app-root').innerHTML = `
-      <div class="banner danger">
-        Firebase 설정이 비어 있습니다. <code>assets/js/firebase-config.js</code>의 <code>firebaseConfig</code>를 채워주세요.
-        자세한 절차는 README.md 참고.
-      </div>`;
-    return;
-  }
+  if (_appMounted) { render(); return; }
 
-  // 로딩 표시 (경과초 카운트 + 빌드 버전 표시 + 진행 로그)
-  startLoadingHud();
-  stage('mountApp: isConfigPlaceholder 통과');
-
-  try {
-    stage('ensureSignedIn() 호출 전');
-    await ensureSignedIn();
-    stage('ensureSignedIn() 완료');
-  } catch (e) {
-    stage('ensureSignedIn() 실패: ' + (e?.code || e?.message || e));
-    stopLoadingHud();
-    showFatalError(e, 'Firebase 익명 로그인 실패');
-    return;
-  }
+  // 로딩 표시
+  $('#app-root').innerHTML = `
+    <div class="banner">
+      <strong>Firestore 연결 중…</strong>
+      <code style="font-size:11px; margin-left:8px">build: ${BUILD_TAG}</code>
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0">진행 로그 (디버그)</h3>
+      <pre id="boot-log" style="font-size:11px; white-space:pre-wrap; margin:0; font-family:ui-monospace,SFMono-Regular,monospace; color:#374151">${_bootLog.join('\n')}</pre>
+    </div>`;
 
   // 첫 Firestore 읽기가 성공하는지 확인 (보안 규칙 문제 조기 감지)
   try {
@@ -112,12 +176,9 @@ async function mountApp() {
     stage('probeFirestore() 완료');
   } catch (e) {
     stage('probeFirestore() 실패: ' + (e?.code || e?.message || e));
-    stopLoadingHud();
     showFatalError(e, 'Firestore 접근 실패 (보안 규칙 또는 네트워크)');
     return;
   }
-  stopLoadingHud();
-  stage('stopLoadingHud, 구독 등록 시작');
 
   subscribeAuthors((authors) => patchState({ authors }));
   subscribeCategories((categories) => patchState({ categories }));
@@ -147,11 +208,12 @@ async function mountApp() {
 
   stage('subscribe(render) 등록');
   subscribe(() => render());
+  _appMounted = true;
   stage('mountApp 완료');
+  render();
 }
 
 async function probeFirestore() {
-  // 문서가 없어도 OK, permission 여부만 확인
   await getDoc(doc(db, 'config', 'authors'));
 }
 
@@ -174,24 +236,32 @@ function showFatalError(err, hint) {
 
 function diagnosisFor(code, msg) {
   const tips = [];
+  if (/popup-blocked/i.test(code + msg)) {
+    tips.push('브라우저가 로그인 팝업을 차단했습니다. 주소창 오른쪽의 팝업 차단 아이콘을 눌러 이 사이트에 허용한 뒤 다시 시도하세요.');
+  }
+  if (/popup-closed-by-user|cancelled-popup-request/i.test(code + msg)) {
+    tips.push('로그인 팝업 창이 닫혔습니다. "다시 시도" 버튼을 눌러 진행하세요.');
+  }
   if (/timeout/i.test(code + msg)) {
-    tips.push('Identity Toolkit API가 활성화되지 않았을 수 있습니다. Google Cloud Console(console.cloud.google.com) → API 및 서비스 → 라이브러리에서 <strong>Identity Toolkit API</strong>를 검색해 "사용" 버튼을 눌러 활성화하세요.');
-    tips.push('사내 방화벽/프록시/VPN이 <code>identitytoolkit.googleapis.com</code> 또는 <code>firestore.googleapis.com</code> 접근을 차단하고 있을 수 있습니다. 다른 네트워크(개인 핫스팟 등)에서 테스트해 보세요.');
-    tips.push('브라우저 확장(AdBlock, uBlock, Privacy Badger 등)이 Google API 도메인을 차단하는 경우도 있습니다. 시크릿 창(Ctrl+Shift+N)으로 재시도하거나 확장을 일시 비활성화하세요.');
-    tips.push('F12 → Network 탭에서 <code>accounts:signUp</code> 요청의 상태(Status 컬럼)를 확인하면 원인을 바로 알 수 있습니다.');
+    tips.push('Identity Toolkit API가 활성화되지 않았을 수 있습니다. Google Cloud Console → API 및 서비스 → 라이브러리에서 <strong>Identity Toolkit API</strong>를 "사용" 으로 변경.');
+    tips.push('사내 방화벽/프록시가 <code>identitytoolkit.googleapis.com</code> 또는 <code>firestore.googleapis.com</code> 을 차단하고 있을 수 있습니다.');
+    tips.push('브라우저 확장(AdBlock 등)을 일시 비활성 또는 시크릿 창으로 재시도하세요.');
   }
   if (/admin-restricted-operation/i.test(code + msg)) {
-    tips.push('Firebase 콘솔 → Authentication → Sign-in method → <strong>익명(Anonymous)</strong> 로그인을 사용 설정했는지 확인하세요.');
+    tips.push('Firebase 콘솔 → Authentication → Sign-in method → <strong>Google</strong> 제공업체를 사용 설정했는지 확인하세요.');
   }
   if (/unauthorized-domain/i.test(code + msg)) {
-    tips.push('Firebase 콘솔 → Authentication → 설정 → 승인된 도메인에 현재 접속 도메인이 포함되어 있는지 확인하세요. localhost는 기본 포함입니다.');
+    tips.push('Firebase 콘솔 → Authentication → 설정 → <strong>승인된 도메인</strong>에 현재 접속 도메인(localhost 또는 github.io)을 추가하세요.');
+  }
+  if (/operation-not-allowed/i.test(code + msg)) {
+    tips.push('Firebase 콘솔 → Authentication → Sign-in method 에서 Google 로그인이 "사용 설정됨" 상태인지 확인하세요.');
   }
   if (/permission|insufficient/i.test(code + msg)) {
-    tips.push('Firestore → 규칙 탭에 README 1-5의 규칙 블록이 <strong>게시(Publish)</strong> 되었는지 확인하세요.');
+    tips.push('Firestore → 규칙 탭에 README 1-5의 <strong>최신 규칙 블록</strong>이 게시되었는지 확인하세요 (isAdmin 헬퍼 포함).');
+    tips.push('Firestore → <code>config/admins</code> 문서의 <code>uids</code> 배열에 본인 uid 가 포함되어 있는지 확인하세요.');
   }
   if (/api-key-not-valid|invalid-api-key|referrer/i.test(code + msg)) {
-    tips.push('assets/js/firebase-config.js 의 apiKey 값이 Firebase 콘솔의 웹앱 config와 일치하는지 확인하세요.');
-    tips.push('Google Cloud Console → API 및 서비스 → 사용자 인증 정보 → 해당 API 키에 HTTP 리퍼러 제한이 걸려있다면 제거하거나 <code>localhost</code>, 배포 도메인을 추가하세요.');
+    tips.push('<code>assets/js/firebase-config.js</code> 의 apiKey 값이 Firebase 콘솔의 웹앱 config 와 일치하는지 확인하세요.');
   }
   if (/failed to get document|unavailable|network/i.test(code + msg)) {
     tips.push('네트워크 연결(사내 프록시/방화벽)로 firestore.googleapis.com 접근이 차단되었을 수 있습니다.');
@@ -202,10 +272,40 @@ function diagnosisFor(code, msg) {
   return tips;
 }
 
+// ─────────────────────────────────────────────────────────
+// 3. 렌더링
+// ─────────────────────────────────────────────────────────
+
+function renderAdminBar(root) {
+  const u = currentUser();
+  const bar = document.createElement('div');
+  bar.className = 'banner';
+  bar.style.display = 'flex';
+  bar.style.justifyContent = 'space-between';
+  bar.style.alignItems = 'center';
+  bar.innerHTML = `
+    <div>관리자 로그인: <strong>${escapeHtml(u?.displayName || u?.email || '(알 수 없음)')}</strong>
+      <span class="muted" style="margin-left:6px">${escapeHtml(u?.email || '')}</span>
+    </div>
+    <div>
+      <code style="font-size:11px; margin-right:10px">build: ${BUILD_TAG}</code>
+      <button class="btn ghost small" id="btn-signout">로그아웃</button>
+    </div>`;
+  root.appendChild(bar);
+  bar.querySelector('#btn-signout').addEventListener('click', async () => {
+    if (!confirm('로그아웃 하시겠습니까?')) return;
+    await signOutAdmin();
+    _appMounted = false;  // 다음 mountApp 호출 시 다시 mount 되도록
+    renderAuthLanding('');
+  });
+}
+
 function render() {
   const s = getState();
   const root = $('#app-root');
   root.innerHTML = '';
+
+  renderAdminBar(root);
 
   const tabs = document.createElement('div');
   tabs.className = 'tabs';
@@ -279,7 +379,6 @@ function renderRoundTab(s) {
     const form = $('#new-round-form', document);
     if (form) form.scrollIntoView({ behavior: 'smooth' });
     else {
-      // render new form panel below
       const np = renderNewRoundForm(s);
       box.appendChild(np);
       np.scrollIntoView({ behavior: 'smooth' });
@@ -650,4 +749,40 @@ function renderArchiveTab(s) {
   return box;
 }
 
-mountApp();
+// ─────────────────────────────────────────────────────────
+// 4. 진입점
+// ─────────────────────────────────────────────────────────
+
+async function boot() {
+  if (isConfigPlaceholder()) {
+    $('#app-root').innerHTML = `
+      <div class="banner danger">
+        Firebase 설정이 비어 있습니다. <code>assets/js/firebase-config.js</code>의 <code>firebaseConfig</code>를 채워주세요.
+        자세한 절차는 README.md 참고.
+      </div>`;
+    return;
+  }
+  stage('boot 시작');
+
+  // onAuthStateChanged 결과를 잠시 기다려(1초) 이미 로그인된 세션이 있으면 자동 진입.
+  // 단, Anonymous 사용자는 관리자로 인정하지 않음.
+  await new Promise((r) => setTimeout(r, 800));
+  const u = currentUser();
+  stage('boot: currentUser=' + (u ? (u.email || u.uid) + (u.isAnonymous ? ' (anon)' : '') : 'null'));
+
+  if (u && !isAnonymousUser()) {
+    // Google 로그인 세션이 이미 있음 → 화이트리스트만 조용히 확인 후 자동 진입
+    try {
+      await ensureAdminSignedIn();
+      await mountApp();
+      return;
+    } catch (e) {
+      if (e?.code === 'auth/not-admin') { renderNotAdmin(e); return; }
+      stage('자동 진입 중 예외: ' + (e?.code || e?.message || e));
+      // 그 외 에러면 랜딩으로 폴백
+    }
+  }
+  renderAuthLanding('');
+}
+
+boot();
